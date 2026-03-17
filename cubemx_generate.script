@@ -1,0 +1,3 @@
+config load Module_test.ioc
+generate code C:/Users/admin/MK96/Module_test
+exit

@@ -1,0 +1,10 @@
+Debug/
+build/
+*.o
+*.d
+*.elf
+*.map
+*.list
+*.su
+*.cyclo
+Thumbs.db
