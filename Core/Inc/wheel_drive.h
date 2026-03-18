@@ -49,10 +49,20 @@ typedef struct
   uint8_t left_b_mismatch;
   uint8_t right_a_mismatch;
   uint8_t right_b_mismatch;
+  uint8_t left_last_dir_state;
+  uint8_t right_last_dir_state;
+  uint8_t left_target_dir_state;
+  uint8_t right_target_dir_state;
+  uint16_t left_target_duty_permille;
+  uint16_t right_target_duty_permille;
 } WheelDriveSnapshot;
 
 #define WHEEL_DRIVE_DUTY_PERMILLE     350U
 #define WHEEL_PWM_MAX_PERMILLE       1000U
+#define WHEEL_TURN_INNER_RATIO_PM     250U
+#define WHEEL_RAMP_INTERVAL_MS         20U
+#define WHEEL_RAMP_STEP_UP_PER_TICK     4U
+#define WHEEL_RAMP_STEP_DOWN_PER_TICK   3U
 
 #define MOTOR_L_EN_ACTIVE_HIGH         0U
 #define MOTOR_L_DIR_ACTIVE_HIGH        0U
@@ -64,6 +74,7 @@ typedef struct
 
 void WheelDrive_Init(TIM_HandleTypeDef *tim, uint32_t left_channel, uint32_t right_channel);
 void WheelDrive_ApplyMode(DriveMode mode, uint16_t duty_permille);
+void WheelDrive_Update(void);
 void WheelDrive_Stop(void);
 void WheelDrive_RunRaw(uint16_t left_duty_permille, uint8_t left_dir,
                        uint16_t right_duty_permille, uint8_t right_dir);

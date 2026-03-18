@@ -28,6 +28,11 @@ static volatile uint16_t g_left_last_duty_permille;
 static volatile uint16_t g_right_last_duty_permille;
 static volatile uint8_t g_left_last_dir_state;
 static volatile uint8_t g_right_last_dir_state;
+static volatile uint16_t g_left_target_duty_permille;
+static volatile uint16_t g_right_target_duty_permille;
+static volatile uint8_t g_left_target_dir_state;
+static volatile uint8_t g_right_target_dir_state;
+static uint32_t g_last_ramp_ms;
 
 #define WHEEL_ENCODER_IRQ_PRIORITY 5U
 
@@ -86,6 +91,55 @@ static uint8_t logic_level_from_active(uint8_t active, uint8_t active_high)
   }
 
   return 0U;
+}
+
+static uint16_t clamp_duty(uint16_t duty)
+{
+  if (duty > WHEEL_PWM_MAX_PERMILLE)
+  {
+    return WHEEL_PWM_MAX_PERMILLE;
+  }
+
+  return duty;
+}
+
+static uint16_t turn_inner_duty(uint16_t duty)
+{
+  uint16_t inner = (uint16_t)(((uint32_t)duty * WHEEL_TURN_INNER_RATIO_PM) / WHEEL_PWM_MAX_PERMILLE);
+
+  if ((duty != 0U) && (inner == 0U))
+  {
+    inner = 1U;
+  }
+
+  return inner;
+}
+
+static uint16_t ramp_towards(uint16_t current, uint16_t target, uint16_t step)
+{
+  if (current < target)
+  {
+    uint16_t delta = (uint16_t)(target - current);
+    if (delta > step)
+    {
+      return (uint16_t)(current + step);
+    }
+
+    return target;
+  }
+
+  if (current > target)
+  {
+    uint16_t delta = (uint16_t)(current - target);
+    if (delta > step)
+    {
+      return (uint16_t)(current - step);
+    }
+
+    return target;
+  }
+
+  return current;
 }
 
 /* 퍼밀(per-mille) 듀티 값을 현재 타이머 채널의 CCR 값으로 반영한다. */
@@ -237,6 +291,14 @@ static void motor_channel_apply(uint8_t index, uint16_t duty, uint8_t dir)
 void WheelDrive_RunRaw(uint16_t left_duty_permille, uint8_t left_dir,
                        uint16_t right_duty_permille, uint8_t right_dir)
 {
+  left_duty_permille = clamp_duty(left_duty_permille);
+  right_duty_permille = clamp_duty(right_duty_permille);
+
+  g_left_target_duty_permille = left_duty_permille;
+  g_right_target_duty_permille = right_duty_permille;
+  g_left_target_dir_state = left_dir;
+  g_right_target_dir_state = right_dir;
+
   motor_channel_apply(0U, left_duty_permille, left_dir);
   motor_channel_apply(1U, right_duty_permille, right_dir);
 }
@@ -254,6 +316,11 @@ void WheelDrive_Init(TIM_HandleTypeDef *tim, uint32_t left_channel, uint32_t rig
   g_right_last_duty_permille = 0U;
   g_left_last_dir_state = 0U;
   g_right_last_dir_state = 0U;
+  g_left_target_duty_permille = 0U;
+  g_right_target_duty_permille = 0U;
+  g_left_target_dir_state = 0U;
+  g_right_target_dir_state = 0U;
+  g_last_ramp_ms = HAL_GetTick() - WHEEL_RAMP_INTERVAL_MS;
 
   if (g_drive_tim == NULL)
   {
@@ -267,59 +334,87 @@ void WheelDrive_Init(TIM_HandleTypeDef *tim, uint32_t left_channel, uint32_t rig
 /* 지정한 주행 모드에 맞춰 좌우 모터 방향과 듀티를 계산해 적용한다. */
 void WheelDrive_ApplyMode(DriveMode mode, uint16_t duty_permille)
 {
+  uint16_t left_duty = 0U;
+  uint16_t right_duty = 0U;
+  uint8_t left_dir = opposite_dir(MOTOR_L_FORWARD_DIR_STATE);
+  uint8_t right_dir = MOTOR_R_FORWARD_DIR_STATE;
+
+  duty_permille = clamp_duty(duty_permille);
   g_current_mode = mode;
 
   if (mode == DRIVE_MODE_STOP)
   {
-    motor_channel_apply(0U, 0U, 0U);
-    motor_channel_apply(1U, 0U, 0U);
+    left_duty = 0U;
+    right_duty = 0U;
   }
   else if (mode == DRIVE_MODE_FORWARD)
   {
-    motor_channel_apply(0U, duty_permille, opposite_dir(MOTOR_L_FORWARD_DIR_STATE));
-    motor_channel_apply(1U, duty_permille, MOTOR_R_FORWARD_DIR_STATE);
+    left_duty = duty_permille;
+    right_duty = duty_permille;
   }
   else if (mode == DRIVE_MODE_REVERSE)
   {
-    motor_channel_apply(0U, duty_permille, opposite_dir(MOTOR_L_FORWARD_DIR_STATE));
-    motor_channel_apply(1U, duty_permille, opposite_dir(MOTOR_R_FORWARD_DIR_STATE));
+    /* Simplified drivetrain: keep fixed wheel directions, only change speed profile. */
+    left_duty = duty_permille;
+    right_duty = duty_permille;
   }
   else if (mode == DRIVE_MODE_RIGHT)
   {
-    uint16_t inner_duty = (uint16_t)(duty_permille / 2U);
-
-    if ((duty_permille != 0U) && (inner_duty == 0U))
-    {
-      inner_duty = 1U;
-    }
-
-    motor_channel_apply(0U, duty_permille, opposite_dir(MOTOR_L_FORWARD_DIR_STATE));
-    motor_channel_apply(1U, inner_duty, MOTOR_R_FORWARD_DIR_STATE);
+    left_duty = duty_permille;
+    right_duty = turn_inner_duty(duty_permille);
   }
   else if (mode == DRIVE_MODE_LEFT)
   {
-    uint16_t inner_duty = (uint16_t)(duty_permille / 2U);
-
-    if ((duty_permille != 0U) && (inner_duty == 0U))
-    {
-      inner_duty = 1U;
-    }
-
-    motor_channel_apply(0U, inner_duty, opposite_dir(MOTOR_L_FORWARD_DIR_STATE));
-    motor_channel_apply(1U, duty_permille, MOTOR_R_FORWARD_DIR_STATE);
+    left_duty = turn_inner_duty(duty_permille);
+    right_duty = duty_permille;
   }
   else if (mode == DRIVE_MODE_CIRCLE)
   {
-    uint16_t inner_duty = (uint16_t)(duty_permille / 2U);
-
-    if ((duty_permille != 0U) && (inner_duty == 0U))
-    {
-      inner_duty = 1U;
-    }
-
-    motor_channel_apply(0U, duty_permille, MOTOR_L_FORWARD_DIR_STATE);
-    motor_channel_apply(1U, inner_duty, MOTOR_R_FORWARD_DIR_STATE);
+    left_duty = duty_permille;
+    right_duty = turn_inner_duty(duty_permille);
   }
+
+  g_left_target_duty_permille = left_duty;
+  g_right_target_duty_permille = right_duty;
+  g_left_target_dir_state = left_dir;
+  g_right_target_dir_state = right_dir;
+
+  WheelDrive_Update();
+}
+
+void WheelDrive_Update(void)
+{
+  uint32_t now;
+  uint16_t left_requested;
+  uint16_t right_requested;
+  uint16_t left_step;
+  uint16_t right_step;
+  uint16_t left_next;
+  uint16_t right_next;
+  uint8_t left_dir_apply;
+  uint8_t right_dir_apply;
+
+  now = HAL_GetTick();
+  if ((uint32_t)(now - g_last_ramp_ms) < WHEEL_RAMP_INTERVAL_MS)
+  {
+    return;
+  }
+  g_last_ramp_ms = now;
+
+  left_requested = g_left_target_duty_permille;
+  right_requested = g_right_target_duty_permille;
+  left_dir_apply = g_left_target_dir_state;
+  right_dir_apply = g_right_target_dir_state;
+
+  left_step = (left_requested > g_left_last_duty_permille) ? WHEEL_RAMP_STEP_UP_PER_TICK : WHEEL_RAMP_STEP_DOWN_PER_TICK;
+  right_step = (right_requested > g_right_last_duty_permille) ? WHEEL_RAMP_STEP_UP_PER_TICK : WHEEL_RAMP_STEP_DOWN_PER_TICK;
+
+  left_next = ramp_towards(g_left_last_duty_permille, left_requested, left_step);
+  right_next = ramp_towards(g_right_last_duty_permille, right_requested, right_step);
+
+  /* Re-apply outputs every ramp tick to keep fixed-direction drive robust against pin glitches. */
+  apply_left_motor(left_next, left_dir_apply);
+  apply_right_motor(right_next, right_dir_apply);
 }
 
 /* 현재 주행 상태를 정지로 전환한다. */
@@ -401,6 +496,12 @@ void WheelDrive_GetSnapshot(WheelDriveSnapshot *snapshot)
   snapshot->left_b_mismatch = (snapshot->left_b_level != snapshot->left_b_expected_level) ? 1U : 0U;
   snapshot->right_a_mismatch = (snapshot->right_a_level != snapshot->right_a_expected_level) ? 1U : 0U;
   snapshot->right_b_mismatch = (snapshot->right_b_level != snapshot->right_b_expected_level) ? 1U : 0U;
+  snapshot->left_last_dir_state = g_left_last_dir_state;
+  snapshot->right_last_dir_state = g_right_last_dir_state;
+  snapshot->left_target_dir_state = g_left_target_dir_state;
+  snapshot->right_target_dir_state = g_right_target_dir_state;
+  snapshot->left_target_duty_permille = g_left_target_duty_permille;
+  snapshot->right_target_duty_permille = g_right_target_duty_permille;
 
   if ((g_drive_tim != NULL) && (g_drive_tim->Instance != NULL))
   {

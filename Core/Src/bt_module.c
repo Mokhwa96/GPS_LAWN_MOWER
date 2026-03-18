@@ -189,6 +189,46 @@ static void log_drive_output(const char *tag)
   debug_log(out);
 }
 
+static void log_direction_alert(const WheelDriveSnapshot *snapshot)
+{
+  char out[480];
+  uint8_t expected_left_run_dir = (MOTOR_L_FORWARD_DIR_STATE == 0U) ? 1U : 0U;
+  uint8_t expected_right_run_dir = MOTOR_R_FORWARD_DIR_STATE;
+
+  if (snapshot == NULL)
+  {
+    return;
+  }
+
+  (void)snprintf(out, sizeof(out),
+                 "[DIR-ALERT] mode=%s tgtDir(L/R)=%lu/%lu lastDir(L/R)=%lu/%lu "
+                 "tgtDuty(L/R)=%lu/%lu ccr(L/R)=%lu/%lu "
+                 "LB(i/o/e/m)=%lu/%lu/%lu/%lu RB(i/o/e/m)=%lu/%lu/%lu/%lu "
+                 "fixedDirExpected(L/R)=%lu/%lu gpioe_idr=0x%04lX gpioe_odr=0x%04lX\n",
+                 WheelDrive_ModeName(snapshot->mode),
+                 (unsigned long)snapshot->left_target_dir_state,
+                 (unsigned long)snapshot->right_target_dir_state,
+                 (unsigned long)snapshot->left_last_dir_state,
+                 (unsigned long)snapshot->right_last_dir_state,
+                 (unsigned long)snapshot->left_target_duty_permille,
+                 (unsigned long)snapshot->right_target_duty_permille,
+                 (unsigned long)snapshot->left_ccr,
+                 (unsigned long)snapshot->right_ccr,
+                 (unsigned long)snapshot->left_b_level,
+                 (unsigned long)snapshot->left_b_odr_level,
+                 (unsigned long)snapshot->left_b_expected_level,
+                 (unsigned long)snapshot->left_b_mismatch,
+                 (unsigned long)snapshot->right_b_level,
+                 (unsigned long)snapshot->right_b_odr_level,
+                 (unsigned long)snapshot->right_b_expected_level,
+                 (unsigned long)snapshot->right_b_mismatch,
+                 (unsigned long)expected_left_run_dir,
+                 (unsigned long)expected_right_run_dir,
+                 (unsigned long)snapshot->gpioe_idr,
+                 (unsigned long)snapshot->gpioe_odr);
+  debug_log(out);
+}
+
 static uint8_t pin_level_from_reg(uint32_t reg, uint16_t pin)
 {
   return ((reg & (uint32_t)pin) != 0U) ? 1U : 0U;
@@ -228,7 +268,7 @@ static void run_motor_pin_probe(void)
 {
   send_text_response("OK,PINTEST,START");
 
-  WheelDrive_Stop();
+  WheelDrive_RunRaw(0U, 0U, 0U, 0U);
   g_current_mode = DRIVE_MODE_STOP;
   HAL_Delay(20U);
   log_motor_pin_probe("STOP_BASE");
@@ -257,7 +297,7 @@ static void run_motor_pin_probe(void)
   HAL_Delay(20U);
   log_motor_pin_probe("R_B_HIGH");
 
-  WheelDrive_Stop();
+  WheelDrive_RunRaw(0U, 0U, 0U, 0U);
   g_current_mode = DRIVE_MODE_STOP;
   HAL_Delay(20U);
   log_motor_pin_probe("RESTORE_STOP");
@@ -291,7 +331,7 @@ static void run_motor_pin_map_probe(void)
 
   send_text_response("OK,MAPTEST,START");
 
-  WheelDrive_Stop();
+  WheelDrive_RunRaw(0U, 0U, 0U, 0U);
   g_current_mode = DRIVE_MODE_STOP;
   HAL_Delay(20U);
 
@@ -423,8 +463,10 @@ static void send_help_response(void)
 static void heartbeat_update(void)
 {
   uint32_t now = HAL_GetTick();
-  char out[320];
+  char out[480];
   WheelDriveSnapshot snapshot;
+  static uint8_t prev_dir_mismatch_l;
+  static uint8_t prev_dir_mismatch_r;
 
   if ((uint32_t)(now - g_last_heartbeat_ms) >= BT_HEARTBEAT_MS)
   {
@@ -439,7 +481,10 @@ static void heartbeat_update(void)
 
     (void)snprintf(out, sizeof(out),
                    "[BT-STATS] irq=%lu drop=%lu mode=%s encL=%lu encR=%lu pe0=%lu pe1=%lu "
-                   "mismatch(LA/LB/RA/RB)=%lu/%lu/%lu/%lu gpioe_idr=0x%04lX gpioe_odr=0x%04lX gpioa_idr=0x%04lX\n",
+                   "mismatch(LA/LB/RA/RB)=%lu/%lu/%lu/%lu "
+                   "dir(L tgt/last i/o/e)=%lu/%lu %lu/%lu/%lu "
+                   "dir(R tgt/last i/o/e)=%lu/%lu %lu/%lu/%lu "
+                   "gpioe_idr=0x%04lX gpioe_odr=0x%04lX gpioa_idr=0x%04lX\n",
                    (unsigned long)g_uart2_irq_count,
                    (unsigned long)g_uart2_drop_count,
                    WheelDrive_ModeName(snapshot.mode),
@@ -451,10 +496,31 @@ static void heartbeat_update(void)
                    (unsigned long)snapshot.left_b_mismatch,
                    (unsigned long)snapshot.right_a_mismatch,
                    (unsigned long)snapshot.right_b_mismatch,
+                   (unsigned long)snapshot.left_target_dir_state,
+                   (unsigned long)snapshot.left_last_dir_state,
+                   (unsigned long)snapshot.left_b_level,
+                   (unsigned long)snapshot.left_b_odr_level,
+                   (unsigned long)snapshot.left_b_expected_level,
+                   (unsigned long)snapshot.right_target_dir_state,
+                   (unsigned long)snapshot.right_last_dir_state,
+                   (unsigned long)snapshot.right_b_level,
+                   (unsigned long)snapshot.right_b_odr_level,
+                   (unsigned long)snapshot.right_b_expected_level,
                    (unsigned long)snapshot.gpioe_idr,
                    (unsigned long)snapshot.gpioe_odr,
                    (unsigned long)snapshot.gpioa_idr);
     debug_log(out);
+
+    if ((snapshot.mode != DRIVE_MODE_STOP) &&
+        ((snapshot.left_b_mismatch != 0U) || (snapshot.right_b_mismatch != 0U) ||
+         (snapshot.left_b_mismatch != prev_dir_mismatch_l) ||
+         (snapshot.right_b_mismatch != prev_dir_mismatch_r)))
+    {
+      log_direction_alert(&snapshot);
+    }
+
+    prev_dir_mismatch_l = snapshot.left_b_mismatch;
+    prev_dir_mismatch_r = snapshot.right_b_mismatch;
     g_last_stats_ms = now;
   }
 }
@@ -799,6 +865,7 @@ void BT_Module_Init(UART_HandleTypeDef *debug_uart, UART_HandleTypeDef *bt_uart)
 void BT_Module_RunStep(void)
 {
   process_uart2_stream();
+  WheelDrive_Update();
   heartbeat_update();
 }
 
