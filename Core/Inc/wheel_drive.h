@@ -37,6 +37,18 @@ typedef struct
   uint8_t left_b_level;
   uint8_t right_a_level;
   uint8_t right_b_level;
+  uint8_t left_a_odr_level;
+  uint8_t left_b_odr_level;
+  uint8_t right_a_odr_level;
+  uint8_t right_b_odr_level;
+  uint8_t left_a_expected_level;
+  uint8_t left_b_expected_level;
+  uint8_t right_a_expected_level;
+  uint8_t right_b_expected_level;
+  uint8_t left_a_mismatch;
+  uint8_t left_b_mismatch;
+  uint8_t right_a_mismatch;
+  uint8_t right_b_mismatch;
 } WheelDriveSnapshot;
 
 #define WHEEL_DRIVE_DUTY_PERMILLE     350U

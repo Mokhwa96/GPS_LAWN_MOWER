@@ -24,6 +24,10 @@ static uint32_t g_right_channel;
 static DriveMode g_current_mode = DRIVE_MODE_STOP;
 static volatile uint32_t g_left_encoder_count;
 static volatile uint32_t g_right_encoder_count;
+static volatile uint16_t g_left_last_duty_permille;
+static volatile uint16_t g_right_last_duty_permille;
+static volatile uint8_t g_left_last_dir_state;
+static volatile uint8_t g_right_last_dir_state;
 
 #define WHEEL_ENCODER_IRQ_PRIORITY 5U
 
@@ -74,6 +78,16 @@ static void write_logic_pin(GPIO_TypeDef *port, uint16_t pin, uint8_t active, ui
   HAL_GPIO_WritePin(port, pin, state);
 }
 
+static uint8_t logic_level_from_active(uint8_t active, uint8_t active_high)
+{
+  if (((active != 0U) && (active_high != 0U)) || ((active == 0U) && (active_high == 0U)))
+  {
+    return 1U;
+  }
+
+  return 0U;
+}
+
 /* 퍼밀(per-mille) 듀티 값을 현재 타이머 채널의 CCR 값으로 반영한다. */
 static void pwm_set_channel(uint32_t channel, uint16_t permille)
 {
@@ -116,9 +130,14 @@ static void pwm_set_channel(uint32_t channel, uint16_t permille)
 }
 
 /* 지정한 GPIO 핀의 현재 입력 레벨을 0 또는 1로 읽어온다. */
-static uint8_t read_output_level(GPIO_TypeDef *port, uint16_t pin)
+static uint8_t read_input_level(GPIO_TypeDef *port, uint16_t pin)
 {
   return (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_SET) ? 1U : 0U;
+}
+
+static uint8_t read_output_level(GPIO_TypeDef *port, uint16_t pin)
+{
+  return ((port->ODR & pin) != 0U) ? 1U : 0U;
 }
 
 static void pwm_set_channel_enabled(uint32_t channel, uint8_t enabled)
@@ -161,6 +180,9 @@ static void apply_left_motor(uint16_t duty, uint8_t dir)
   uint8_t enabled = (duty != 0U) ? 1U : 0U;
   uint8_t dir_active = (dir == 0U) ? 1U : 0U;
 
+  g_left_last_duty_permille = duty;
+  g_left_last_dir_state = dir;
+
   pwm_set_channel(g_left_channel, duty);
 
   pwm_set_channel_enabled(g_left_channel, enabled);
@@ -180,6 +202,9 @@ static void apply_right_motor(uint16_t duty, uint8_t dir)
 {
   uint8_t enabled = (duty != 0U) ? 1U : 0U;
   uint8_t dir_active = (dir == 0U) ? 1U : 0U;
+
+  g_right_last_duty_permille = duty;
+  g_right_last_dir_state = dir;
 
   pwm_set_channel(g_right_channel, duty);
 
@@ -225,6 +250,10 @@ void WheelDrive_Init(TIM_HandleTypeDef *tim, uint32_t left_channel, uint32_t rig
   g_current_mode = DRIVE_MODE_STOP;
   g_left_encoder_count = 0U;
   g_right_encoder_count = 0U;
+  g_left_last_duty_permille = 0U;
+  g_right_last_duty_permille = 0U;
+  g_left_last_dir_state = 0U;
+  g_right_last_dir_state = 0U;
 
   if (g_drive_tim == NULL)
   {
@@ -247,7 +276,7 @@ void WheelDrive_ApplyMode(DriveMode mode, uint16_t duty_permille)
   }
   else if (mode == DRIVE_MODE_FORWARD)
   {
-    motor_channel_apply(0U, duty_permille, MOTOR_L_FORWARD_DIR_STATE);
+    motor_channel_apply(0U, duty_permille, opposite_dir(MOTOR_L_FORWARD_DIR_STATE));
     motor_channel_apply(1U, duty_permille, MOTOR_R_FORWARD_DIR_STATE);
   }
   else if (mode == DRIVE_MODE_REVERSE)
@@ -257,13 +286,27 @@ void WheelDrive_ApplyMode(DriveMode mode, uint16_t duty_permille)
   }
   else if (mode == DRIVE_MODE_RIGHT)
   {
+    uint16_t inner_duty = (uint16_t)(duty_permille / 2U);
+
+    if ((duty_permille != 0U) && (inner_duty == 0U))
+    {
+      inner_duty = 1U;
+    }
+
     motor_channel_apply(0U, duty_permille, opposite_dir(MOTOR_L_FORWARD_DIR_STATE));
-    motor_channel_apply(1U, duty_permille, MOTOR_R_FORWARD_DIR_STATE);
+    motor_channel_apply(1U, inner_duty, MOTOR_R_FORWARD_DIR_STATE);
   }
   else if (mode == DRIVE_MODE_LEFT)
   {
-    motor_channel_apply(0U, duty_permille, MOTOR_L_FORWARD_DIR_STATE);
-    motor_channel_apply(1U, duty_permille, opposite_dir(MOTOR_R_FORWARD_DIR_STATE));
+    uint16_t inner_duty = (uint16_t)(duty_permille / 2U);
+
+    if ((duty_permille != 0U) && (inner_duty == 0U))
+    {
+      inner_duty = 1U;
+    }
+
+    motor_channel_apply(0U, inner_duty, opposite_dir(MOTOR_L_FORWARD_DIR_STATE));
+    motor_channel_apply(1U, duty_permille, MOTOR_R_FORWARD_DIR_STATE);
   }
   else if (mode == DRIVE_MODE_CIRCLE)
   {
@@ -294,6 +337,11 @@ DriveMode WheelDrive_GetMode(void)
 /* 디버그 출력을 위해 모터/엔코더/타이머 상태를 스냅샷으로 모은다. */
 void WheelDrive_GetSnapshot(WheelDriveSnapshot *snapshot)
 {
+  uint8_t left_enabled;
+  uint8_t right_enabled;
+  uint8_t left_dir_active;
+  uint8_t right_dir_active;
+
   if (snapshot == NULL)
   {
     return;
@@ -311,12 +359,48 @@ void WheelDrive_GetSnapshot(WheelDriveSnapshot *snapshot)
   snapshot->gpioe_odr = GPIOE->ODR;
   snapshot->left_encoder_count = g_left_encoder_count;
   snapshot->right_encoder_count = g_right_encoder_count;
-  snapshot->left_encoder_level = read_output_level(ENC_LEFT_GPIO_Port, ENC_LEFT_Pin);
-  snapshot->right_encoder_level = read_output_level(ENC_RIGHT_GPIO_Port, ENC_RIGHT_Pin);
-  snapshot->left_a_level = read_output_level(MOTOR_L_A_GPIO_Port, MOTOR_L_A_Pin);
-  snapshot->left_b_level = read_output_level(MOTOR_L_B_GPIO_Port, MOTOR_L_B_Pin);
-  snapshot->right_a_level = read_output_level(MOTOR_R_A_GPIO_Port, MOTOR_R_A_Pin);
-  snapshot->right_b_level = read_output_level(MOTOR_R_B_GPIO_Port, MOTOR_R_B_Pin);
+  snapshot->left_encoder_level = read_input_level(ENC_LEFT_GPIO_Port, ENC_LEFT_Pin);
+  snapshot->right_encoder_level = read_input_level(ENC_RIGHT_GPIO_Port, ENC_RIGHT_Pin);
+  snapshot->left_a_level = read_input_level(MOTOR_L_A_GPIO_Port, MOTOR_L_A_Pin);
+  snapshot->left_b_level = read_input_level(MOTOR_L_B_GPIO_Port, MOTOR_L_B_Pin);
+  snapshot->right_a_level = read_input_level(MOTOR_R_A_GPIO_Port, MOTOR_R_A_Pin);
+  snapshot->right_b_level = read_input_level(MOTOR_R_B_GPIO_Port, MOTOR_R_B_Pin);
+  snapshot->left_a_odr_level = read_output_level(MOTOR_L_A_GPIO_Port, MOTOR_L_A_Pin);
+  snapshot->left_b_odr_level = read_output_level(MOTOR_L_B_GPIO_Port, MOTOR_L_B_Pin);
+  snapshot->right_a_odr_level = read_output_level(MOTOR_R_A_GPIO_Port, MOTOR_R_A_Pin);
+  snapshot->right_b_odr_level = read_output_level(MOTOR_R_B_GPIO_Port, MOTOR_R_B_Pin);
+
+  left_enabled = (g_left_last_duty_permille != 0U) ? 1U : 0U;
+  right_enabled = (g_right_last_duty_permille != 0U) ? 1U : 0U;
+  left_dir_active = (g_left_last_dir_state == 0U) ? 1U : 0U;
+  right_dir_active = (g_right_last_dir_state == 0U) ? 1U : 0U;
+
+  if (left_enabled == 0U)
+  {
+    snapshot->left_a_expected_level = logic_level_from_active(0U, MOTOR_L_EN_ACTIVE_HIGH);
+    snapshot->left_b_expected_level = logic_level_from_active(0U, MOTOR_L_DIR_ACTIVE_HIGH);
+  }
+  else
+  {
+    snapshot->left_a_expected_level = logic_level_from_active(1U, MOTOR_L_EN_ACTIVE_HIGH);
+    snapshot->left_b_expected_level = logic_level_from_active(left_dir_active, MOTOR_L_DIR_ACTIVE_HIGH);
+  }
+
+  if (right_enabled == 0U)
+  {
+    snapshot->right_a_expected_level = logic_level_from_active(0U, MOTOR_R_EN_ACTIVE_HIGH);
+    snapshot->right_b_expected_level = logic_level_from_active(0U, MOTOR_R_DIR_ACTIVE_HIGH);
+  }
+  else
+  {
+    snapshot->right_a_expected_level = logic_level_from_active(1U, MOTOR_R_EN_ACTIVE_HIGH);
+    snapshot->right_b_expected_level = logic_level_from_active(right_dir_active, MOTOR_R_DIR_ACTIVE_HIGH);
+  }
+
+  snapshot->left_a_mismatch = (snapshot->left_a_level != snapshot->left_a_expected_level) ? 1U : 0U;
+  snapshot->left_b_mismatch = (snapshot->left_b_level != snapshot->left_b_expected_level) ? 1U : 0U;
+  snapshot->right_a_mismatch = (snapshot->right_a_level != snapshot->right_a_expected_level) ? 1U : 0U;
+  snapshot->right_b_mismatch = (snapshot->right_b_level != snapshot->right_b_expected_level) ? 1U : 0U;
 
   if ((g_drive_tim != NULL) && (g_drive_tim->Instance != NULL))
   {
